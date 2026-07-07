@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 import logging
@@ -5,6 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from collections import deque
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -13,63 +15,44 @@ TELEGRAM_TOKEN = "8585154138:AAFgKhUTg1qP5bGUBXqecSDeewHp3LwT-hU"
 ADMIN_CHAT_ID = 5245111094
 TWELVE_DATA_KEY = "460e31437f314674b7ce39412c9cb050"
 
-SYMBOLS = ["EUR/USD", "GBP/USD"]       # زوجان رئيسيان
-FETCH_INTERVAL = 60                   # ثانية بين الجلب
-SIGNAL_COOLDOWN = 120                 # ثانيتين بين إشارات نفس الزوج
-TRADE_DURATION_MINUTES = 5            # مدة الصفقة
+SYMBOLS = ["EUR/USD", "GBP/USD"]
+FETCH_INTERVAL = 60
+SIGNAL_COOLDOWN = 120
+TRADE_DURATION_MINUTES = 5
 
-# استراتيجية 5 دقائق
 FAST_EMA, SLOW_EMA = 50, 200
 RSI_PERIOD = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
-# ==================== فلتر الأخبار (قائمة ثابتة) ====================
-# الأوقات بتوقيت UTC. سنضيف بعض الأحداث القوية الشهرية/الأسبوعية.
-# يمكنك تعديل هذه القائمة أو إضافة المزيد.
-# الصيغة: (شهر, يوم_من_الشهر_أو_يوم_أسبوع, ساعة, دقيقة, مدة_الحظر_بالدقائق)
-# مثال: Non-Farm Payrolls أول جمعة من الشهر الساعة 13:30 UTC، الحظر 30 دقيقة قبل وبعد.
+# ==================== فلتر الأخبار ====================
 NEWS_EVENTS = [
-    # (الشهر (1-12), (None=كل شهر, أو رقم محدد), (None=كل يوم, أو رقم), ساعة, دقيقة, مدة الحظر قبل/بعد بالدقائق)
-    # Non-Farm Payrolls (أول جمعة)
-    ("first_friday", 13, 30, 45),     # حظر 45 دقيقة حولها
-    # قرار الفائدة الفيدرالي (تقريبي، يمكن ضبطه)
-    ("third_wednesday", 18, 0, 60),   # كل رابع أربعاء؟ سنستخدم تقريب
-    # مؤشر أسعار المستهلك CPI (شهرياً، بين 10-15 من الشهر 13:30 UTC)
-    ("monthly", 10, 13, 30, 30),      # تقريب، سيتم التعديل
+    ("first_friday", 13, 30, 45),
+    ("third_wednesday", 18, 0, 60),
+    ("monthly", 10, 13, 30, 30),
 ]
 
 def is_news_time():
-    """التحقق مما إذا كان الوقت الحالي ضمن فترة حظر أخبار"""
-    now_utc = datetime.utcnow()
-    weekday = now_utc.weekday()  # 0=Monday
+    now_utc = datetime.now(datetime.UTC)  # ✅ إصلاح التحذير
+    weekday = now_utc.weekday()
     day = now_utc.day
     month = now_utc.month
     hour = now_utc.hour
     minute = now_utc.minute
 
     for event in NEWS_EVENTS:
-        event_type = event[0]
-        event_hour = event[1]
-        event_minute = event[2]
-        block_minutes = event[3]
-
-        # حساب وقت بداية الحدث
+        event_type, event_hour, event_minute, block_minutes = event
         event_time = None
         if event_type == "first_friday":
-            # أول جمعة من الشهر
-            if weekday == 4 and day <= 7:  # أول جمعة
+            if weekday == 4 and day <= 7:
                 event_time = datetime(now_utc.year, month, day, event_hour, event_minute)
         elif event_type == "third_wednesday":
-            # ثالث أربعاء من الشهر (أيام 15-21)
             if weekday == 2 and 15 <= day <= 21:
                 event_time = datetime(now_utc.year, month, day, event_hour, event_minute)
         elif event_type == "monthly":
-            # يوم 10 من كل شهر مثلاً
-            if day == event[2]:  # event[2] هو يوم الشهر
+            if day == event[2]:
                 event_time = datetime(now_utc.year, month, day, event_hour, event_minute)
 
         if event_time:
-            # حساب الفرق بالدقائق
             diff = abs((now_utc - event_time).total_seconds()) / 60
             if diff <= block_minutes:
                 return True
@@ -80,7 +63,7 @@ price_buffers = {sym: deque(maxlen=500) for sym in SYMBOLS}
 lock = threading.Lock()
 signal_enabled = False
 last_signal_times = {sym: 0 for sym in SYMBOLS}
-app = None
+bot_app = None  # لتطبيق تيليجرام
 
 def calculate_signal(symbol):
     with lock:
@@ -108,7 +91,6 @@ def calculate_signal(symbol):
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
     uptrend = last['ema_fast'] > last['ema_slow']
     downtrend = last['ema_fast'] < last['ema_slow']
 
@@ -128,20 +110,16 @@ def fetch_loop():
                     price = float(resp['price'])
                     with lock:
                         price_buffers[sym].append(price)
-
                     now_ts = time.time()
                     if signal_enabled and (now_ts - last_signal_times[sym] > SIGNAL_COOLDOWN):
-                        # فلتر الأخبار
                         if is_news_time():
                             logging.info(f"إشارة ممنوعة بسبب وقت أخبار: {sym}")
                             continue
-
                         res = calculate_signal(sym)
                         if res:
                             direction, cp = res
                             last_signal_times[sym] = now_ts
-                            # تحويل التوقيت إلى صنعاء (UTC+3)
-                            sanaa_time = datetime.utcnow() + timedelta(hours=3)
+                            sanaa_time = datetime.now(datetime.UTC) + timedelta(hours=3)
                             time_str = sanaa_time.strftime("%Y-%m-%d %H:%M:%S")
                             text = (
                                 f"📊 إشارة صفقة 5 دقائق\n"
@@ -151,13 +129,13 @@ def fetch_loop():
                                 f"توقيت صنعاء: {time_str}\n"
                                 f"يمكن الدخول الآن قبل اكتمال الشمعة"
                             )
-                            app.bot.send_message(ADMIN_CHAT_ID, text)
+                            bot_app.bot.send_message(ADMIN_CHAT_ID, text)
                             logging.info(f"إشارة {sym}: {direction} @ {cp:.5f}")
             except Exception as e:
                 logging.error(f"Error {sym}: {e}")
         time.sleep(FETCH_INTERVAL)
 
-# تيليجرام
+# ==================== بوت تيليجرام ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 بوت الإشارات (5 دقائق) - توقيت صنعاء\n"
@@ -185,11 +163,30 @@ async def signal_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signal_enabled = False
     await update.message.reply_text("⏸️ الإشارات متوقفة")
 
+# ==================== Flask خادم ====================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# ==================== تشغيل ====================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    threading.Thread(target=fetch_loop, daemon=True).start()
+
+    # تشغيل خيط السيرفر Flask
+    Thread(target=run_web_server).start()
+
+    # تشغيل خيط جلب البيانات والإشارات
+    Thread(target=fetch_loop, daemon=True).start()
+
+    # تشغيل بوت تيليجرام
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, h in [("start", start_cmd), ("status", status), ("signal_on", signal_on), ("signal_off", signal_off)]:
         application.add_handler(CommandHandler(cmd, h))
-    app = application
+    bot_app = application
     application.run_polling()
