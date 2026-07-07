@@ -1,27 +1,30 @@
-import os, json, time, threading, logging
-import requests, websocket, pandas as pd
+import time
+import threading
+import logging
+import requests
+import pandas as pd
 from collections import deque
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# إعدادات (ضع مفتاح Twelve Data مكان YOUR_API_KEY أو في متغيرات بيئة Render)
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "YOUR_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8585154138:AAFgKhUTg1qP5bGUBXqecSDeewHp3LwT-hU")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "5245111094"))
+# ==================== إعدادات ====================
+TELEGRAM_TOKEN = "8585154138:AAFgKhUTg1qP5bGUBXqecSDeewHp3LwT-hU"
+ADMIN_CHAT_ID = 5245111094
+TWELVE_DATA_KEY = "460e31437f314674b7ce39412c9cb050"
 
-WS_SYMBOL = "EUR/USD"
-REST_SYMBOLS = ["GBP/USD", "USD/JPY", "AUD/USD"]
-ALL_SYMBOLS = [WS_SYMBOL] + REST_SYMBOLS
-REST_INTERVAL = 600          # 10 دقائق
-SIGNAL_COOLDOWN = 120
+SYMBOLS = ["EUR/USD", "GBP/USD"]   # زوجان رئيسيان
+FETCH_INTERVAL = 60               # ثانية بين كل جلب
+SIGNAL_COOLDOWN = 120             # ثانيتين بين إشارات نفس الزوج
+
 FAST_EMA, SLOW_EMA = 50, 200
 RSI_PERIOD = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
-price_buffers = {sym: deque(maxlen=500) for sym in ALL_SYMBOLS}
+# ==================== تخزين الأسعار ====================
+price_buffers = {sym: deque(maxlen=500) for sym in SYMBOLS}
 lock = threading.Lock()
 signal_enabled = False
-last_signal_times = {sym: 0 for sym in ALL_SYMBOLS}
+last_signal_times = {sym: 0 for sym in SYMBOLS}
 app = None
 
 def calculate_signal(symbol):
@@ -53,42 +56,9 @@ def calculate_signal(symbol):
         return 'PUT', last['close']
     return None
 
-# WebSocket للرمز الرئيسي
-def on_message(ws, message):
-    global signal_enabled
-    try:
-        data = json.loads(message)
-        if data.get('event')=='price':
-            price = (float(data['bid'])+float(data['ask']))/2
-            with lock:
-                price_buffers[WS_SYMBOL].append(price)
-            now = time.time()
-            if signal_enabled and (now - last_signal_times[WS_SYMBOL] > SIGNAL_COOLDOWN):
-                res = calculate_signal(WS_SYMBOL)
-                if res:
-                    direction, cp = res
-                    last_signal_times[WS_SYMBOL] = now
-                    app.bot.send_message(ADMIN_CHAT_ID, f"📊 {WS_SYMBOL}: {'CALL' if direction=='CALL' else 'PUT'} @ {cp:.5f}")
-    except Exception as e:
-        logging.error(f"WS msg: {e}")
-
-def on_open(ws):
-    ws.send(json.dumps({"action":"subscribe","params":{"symbols":WS_SYMBOL}}))
-def on_error(ws, error): logging.error(f"WS error: {error}")
-def on_close(ws, status, msg):
-    time.sleep(10)
-    start_ws()
-
-def start_ws():
-    ws = websocket.WebSocketApp(
-        f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_KEY}",
-        on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
-    threading.Thread(target=ws.run_forever, daemon=True).start()
-
-# REST لباقي الأزواج
-def fetch_rest():
+def fetch_loop():
     while True:
-        for sym in REST_SYMBOLS:
+        for sym in SYMBOLS:
             try:
                 url = f"https://api.twelvedata.com/price?symbol={sym}&apikey={TWELVE_DATA_KEY}"
                 resp = requests.get(url).json()
@@ -102,32 +72,32 @@ def fetch_rest():
                         if res:
                             direction, cp = res
                             last_signal_times[sym] = now
-                            app.bot.send_message(ADMIN_CHAT_ID, f"📊 {sym}: {'CALL' if direction=='CALL' else 'PUT'} @ {cp:.5f}")
+                            app.bot.send_message(ADMIN_CHAT_ID,
+                                f"📊 {sym}: {'شراء CALL' if direction=='CALL' else 'بيع PUT'} @ {cp:.5f}")
             except Exception as e:
-                logging.error(f"REST {sym}: {e}")
-        time.sleep(REST_INTERVAL)
+                logging.error(f"Error {sym}: {e}")
+        time.sleep(FETCH_INTERVAL)
 
 # تيليجرام
-async def start_cmd(update, context):
-    await update.message.reply_text("جاهز /signal_on /signal_off /status")
-async def status(update, context):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 بوت مؤقت (REST فقط)\n/signal_on /signal_off /status")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = "مفعلة" if signal_enabled else "متوقفة"
-    msg = f"{state}\n"
-    for s in ALL_SYMBOLS:
+    msg = f"الحالة: {state}\n"
+    for s in SYMBOLS:
         with lock: p = price_buffers[s][-1] if price_buffers[s] else None
         msg += f"{s}: {p:.5f}\n" if p else f"{s}: ---\n"
     await update.message.reply_text(msg)
-async def signal_on(update, context):
+async def signal_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global signal_enabled; signal_enabled = True
-    await update.message.reply_text("✅ مفعلة")
-async def signal_off(update, context):
+    await update.message.reply_text("✅ مفعلة (مؤقت)")
+async def signal_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global signal_enabled; signal_enabled = False
     await update.message.reply_text("⏸️ متوقفة")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    start_ws()
-    threading.Thread(target=fetch_rest, daemon=True).start()
+    threading.Thread(target=fetch_loop, daemon=True).start()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, h in [("start", start_cmd), ("status", status), ("signal_on", signal_on), ("signal_off", signal_off)]:
         application.add_handler(CommandHandler(cmd, h))
